@@ -5,7 +5,7 @@ from __future__ import annotations
 
 
 class NormalizerError(Exception):
-
+      """Base class for all normalizer exceptions."""
 
 class UnrecognizedBlockTypeError(NormalizerError):
     def __init__(self, block_type: str, marker_block_id: str, page_index: int) -> None:
