@@ -945,6 +945,158 @@ def test_extraction_mixed_failure_is_not_tagged_provider_empty_response(env):
 
 
 # --------------------------------------------------------------------- #
+# Malformed harmony-format tool-call retry (real confirmed provider
+# defect: a gpt-oss-120b/vLLM channel-separator token leaks into a tool
+# NAME, e.g. read_section<|channel|>commentary -- see
+# _has_malformed_harmony_tool_call's own docstring for the real captured
+# case, run final_check_observation_daren).
+# --------------------------------------------------------------------- #
+
+
+_MALFORMED_TOOL_CALL_STDOUT = json.dumps({
+    "type": "tool_use",
+    "part": {
+        "type": "tool",
+        "tool": "invalid",
+        "state": {
+            "status": "completed",
+            "input": {
+                "tool": "read_section<|channel|>commentary",
+                "error": "Model tried to call unavailable tool 'read_section<|channel|>commentary'. "
+                         "Available tools: read_document_start, read_section, read_table, ...",
+            },
+            "output": "The arguments provided to the tool are invalid: unavailable tool",
+        },
+    },
+})
+
+
+def test_has_malformed_harmony_tool_call_detects_the_real_captured_signature():
+    assert orchestrator._has_malformed_harmony_tool_call(_MALFORMED_TOOL_CALL_STDOUT) is True
+
+
+def test_has_malformed_harmony_tool_call_false_for_a_clean_response():
+    assert orchestrator._has_malformed_harmony_tool_call('{"part": {"type": "text", "text": "hello"}}') is False
+
+
+def test_has_malformed_harmony_tool_call_requires_both_parts_of_the_signature():
+    assert orchestrator._has_malformed_harmony_tool_call("<|channel|> present but no unavailable-tool text") is False
+    assert orchestrator._has_malformed_harmony_tool_call("unavailable tool mentioned but no channel token") is False
+
+
+def _malformed_invocation(agent="extractor") -> orchestrator.AgentInvocation:
+    return orchestrator.AgentInvocation(
+        agent=agent, model="test-model", prompt="p", returncode=0, stdout=_MALFORMED_TOOL_CALL_STDOUT, stderr="",
+        final_text=None, parsed_json=None,
+        parse_error="provider_malformed_response: harmony-format tool-call name leak detected",
+        had_malformed_tool_call=True,
+    )
+
+
+def _malformed_but_valid_looking_invocation(agent="extractor") -> orchestrator.AgentInvocation:
+    # A real confirmed case: the malformed-tool-call signature appears in
+    # stdout ALONGSIDE what looks like a valid final answer elsewhere in
+    # the stream -- _invoke_agent_once must never trust that answer.
+    return orchestrator.AgentInvocation(
+        agent=agent, model="test-model", prompt="p", returncode=0, stdout=_MALFORMED_TOOL_CALL_STDOUT, stderr="",
+        final_text='{"a": 1}', parsed_json={"a": 1}, parse_error=None,
+        had_malformed_tool_call=True,
+    )
+
+
+def test_invoke_agent_retries_internally_on_malformed_tool_call_then_succeeds(monkeypatch):
+    calls = []
+    responses = [_malformed_invocation(), _malformed_invocation(), _real_invocation()]
+
+    def fake_once(agent, model, prompt, timeout):
+        calls.append(1)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(orchestrator, "_invoke_agent_once", fake_once)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda s: None)
+
+    result = orchestrator.invoke_agent("extractor", "test-model", "p")
+    assert len(calls) == 3
+    assert result.final_text == '{"a": 1}'
+    assert result.had_malformed_tool_call is False
+
+
+def test_invoke_agent_retries_even_when_malformed_response_has_valid_looking_output(monkeypatch):
+    calls = []
+    responses = [_malformed_but_valid_looking_invocation(), _real_invocation()]
+
+    def fake_once(agent, model, prompt, timeout):
+        calls.append(1)
+        return responses[len(calls) - 1]
+
+    monkeypatch.setattr(orchestrator, "_invoke_agent_once", fake_once)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda s: None)
+
+    result = orchestrator.invoke_agent("extractor", "test-model", "p")
+    # Must NOT stop on attempt 1 just because final_text/parsed_json looked
+    # valid -- had_malformed_tool_call=True forces a retry regardless.
+    assert len(calls) == 2
+    assert result.had_malformed_tool_call is False
+
+
+def test_invoke_agent_gives_up_after_exhausting_malformed_tool_call_retries(monkeypatch):
+    calls = []
+
+    def fake_once(agent, model, prompt, timeout):
+        calls.append(1)
+        return _malformed_invocation()
+
+    monkeypatch.setattr(orchestrator, "_invoke_agent_once", fake_once)
+    monkeypatch.setattr(orchestrator.time, "sleep", lambda s: None)
+
+    result = orchestrator.invoke_agent("extractor", "test-model", "p")
+    assert len(calls) == orchestrator.MAX_EMPTY_RESPONSE_RETRIES + 1
+    assert result.had_malformed_tool_call is True
+
+
+def test_extraction_all_malformed_tool_call_failures_tagged_provider_malformed_response(env):
+    invoke = make_invoke_sequence([
+        ("extractor", _malformed_invocation()),
+        ("extractor", _malformed_invocation()),
+        ("extractor", _malformed_invocation()),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+    )
+    assert result.status == "error"
+    assert result.detail["failure_class"] == "provider_malformed_response"
+
+
+def test_extraction_malformed_takes_priority_over_empty_when_mixed(env):
+    invoke = make_invoke_sequence([
+        ("extractor", _empty_invocation()),
+        ("extractor", _malformed_invocation()),
+        ("extractor", _empty_invocation()),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+    )
+    assert result.status == "error"
+    assert result.detail["failure_class"] == "provider_malformed_response"
+
+
+def test_extraction_malformed_mixed_with_genuine_content_failure_is_not_tagged(env):
+    invoke = make_invoke_sequence([
+        ("extractor", _malformed_invocation()),
+        ("extractor", _inv("extractor", {"paper_id": PAPER_ID, "entity_type": "Citation", "record_id": PAPER_ID, "facts": []})),
+        ("extractor", _malformed_invocation()),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+    )
+    assert result.status == "error"
+    assert "failure_class" not in result.detail
+
+
+# --------------------------------------------------------------------- #
 # Health / staleness guard
 # --------------------------------------------------------------------- #
 
@@ -1821,6 +1973,30 @@ def test_ref_mismatch_allowed_set_membership():
     assert orchestrator._ref_mismatch("id_a", ["id_a", "id_b"]) is False
     assert orchestrator._ref_mismatch("id_c", ["id_a", "id_b"]) is True
     assert orchestrator._ref_mismatch(["id_a"], ["id_a", "id_b"]) is False
+
+
+def test_ref_mismatch_never_crashes_on_an_unhashable_candidate_value():
+    # Real Daren-1997-Canopy crash (run 20260916T132735_dd8d7c47): Conversion
+    # returned `treatment_id` as an UNRESOLVED `{value, provenance_label,
+    # source}` dict instead of the bare string converter.md requires, and
+    # the allowed-set membership check (`candidate_value not in allowed`)
+    # raised an unhandled `TypeError: unhashable type: 'dict'`, crashing the
+    # whole run instead of reporting a deterministic ref-mismatch error. A
+    # dict can never legitimately be a known reference id, so this must
+    # report a mismatch, not raise.
+    malformed = {"value": None, "provenance_label": "UNRESOLVED", "unresolved_reason": "..."}
+    assert orchestrator._ref_mismatch(malformed, ["id_a", "id_b"]) is True
+    assert orchestrator._ref_mismatch(malformed, "id_a") is True
+    # A malformed entry alongside a genuinely valid one still matches --
+    # the valid id ("id_a") is a real member, the unhashable dict is simply
+    # never a candidate for matching, not a reason to hide a real match.
+    assert orchestrator._ref_mismatch([malformed, "id_a"], ["id_a", "id_b"]) is False
+    assert orchestrator._ref_mismatch([malformed], ["id_a", "id_b"]) is True
+
+    # `_ref_expectation_message` (the other half of the same call site) must
+    # also render an unhashable actual value without raising.
+    message = orchestrator._ref_expectation_message("treatment_id", ["id_a", "id_b"], malformed)
+    assert repr(malformed) in message
 
 
 def test_run_enumeration_rejects_linked_candidate_slug_not_in_pool(env):
