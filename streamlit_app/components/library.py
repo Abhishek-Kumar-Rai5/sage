@@ -294,17 +294,29 @@ def _run_pipeline_for(paper_id: str):
     had_error = False
     had_warnings = False
     with st.status(f"Running pipeline for {paper_id}...", expanded=True) as status_box:
+        # A real paper can produce 50-90+ progress events -- writing each
+        # one straight into the status box (no fixed height) made it grow
+        # without bound, pushing further down the page every few seconds
+        # and never staying in one place to scroll back to. A fixed-height,
+        # internally-scrollable container keeps this box's position and
+        # size on the page completely stable for the whole run; only the
+        # log inside it scrolls, same as the review-progress panels
+        # elsewhere on this page (see the height=300/360 containers above).
+        log = st.container(height=280, border=False)
         for event in api_client.run_pipeline_for_paper(paper_id):
             stages.append(event)
-            st.write(event["message"])
+            with log:
+                st.write(event["message"])
+                if event["status"] == "error":
+                    st.error(f"Failed at stage `{event['stage']}`: {event['message']}")
+                if event["status"] == "done_with_errors":
+                    st.warning(event["message"])
             if event["status"] == "error":
                 had_error = True
-                st.error(f"Failed at stage `{event['stage']}`: {event['message']}")
                 status_box.update(label=f"Failed at stage: {event['stage']}", state="error")
                 break
             if event["status"] == "done_with_errors":
                 had_warnings = True
-                st.warning(event["message"])
         if not had_error:
             label = "Complete." if not had_warnings else "Complete, with some errors — see below."
             status_box.update(label=label, state="complete")
