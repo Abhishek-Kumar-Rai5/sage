@@ -72,6 +72,16 @@ class EnumerationCandidate(BaseModel):
         description="Reserved for later phases (e.g. an Observation candidate linking to a Treatment/Variable "
                     "candidate_id) -- always empty for Variable in Phase A.",
     )
+    known_value: Optional[str] = Field(
+        default=None,
+        description="Deterministically known expected reported value for this candidate -- set ONLY by "
+                    "table-enumeration Step C (_table_classification_to_candidates), which already knows the "
+                    "exact source cell text a candidate was cross-producted from. Never set by free-form LLM "
+                    "enumeration (the enumeration prompt never mentions this field). Used solely for the "
+                    "orchestrator's own post-Extraction cross-check (see _extraction_matches_known_value) that "
+                    "Extraction actually read THIS candidate's own cell rather than a different row/column's "
+                    "value -- never surfaced to a model as an instruction to copy verbatim.",
+    )
 
 
 class EnumerationResult(BaseModel):

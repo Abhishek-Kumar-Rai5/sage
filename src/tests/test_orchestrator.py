@@ -1243,6 +1243,176 @@ def test_null_fact_with_empty_anchors_is_rejected_same_as_a_valued_fact(env):
 
 
 # --------------------------------------------------------------------- #
+# Phase 1.1: raw evidence grounding gate -- RawFact.raw_text_excerpt is
+# never previously re-verified against the paper's own content.md before
+# this evidence was handed to the sealed Conversion stage. See
+# orchestrator._raw_extraction_grounding_errors's own docstring.
+# --------------------------------------------------------------------- #
+
+
+def test_raw_extraction_grounding_errors_empty_when_all_facts_grounded(env):
+    extraction = orchestrator.RawExtraction.model_validate(RAW_EXTRACTION)
+    assert orchestrator._raw_extraction_grounding_errors(PAPER_ID, extraction) == []
+
+
+def test_raw_extraction_grounding_errors_flags_fabricated_excerpt(env):
+    bad = dict(RAW_EXTRACTION)
+    bad["facts"] = RAW_EXTRACTION["facts"] + [
+        {"field_name": "extra", "raw_value": "x",
+         "raw_text_excerpt": "an invented sentence that never appears anywhere in this paper",
+         "anchors": ["b:0004"]},
+    ]
+    extraction = orchestrator.RawExtraction.model_validate(bad)
+    errors = orchestrator._raw_extraction_grounding_errors(PAPER_ID, extraction)
+    assert len(errors) == 1
+    assert errors[0]["field"] == "facts[3].raw_text_excerpt"
+
+
+def test_raw_extraction_grounding_errors_flags_nonexistent_anchor(env):
+    bad = {
+        "paper_id": PAPER_ID, "entity_type": "Citation", "record_id": PAPER_ID,
+        "facts": [{"field_name": "x", "raw_value": "y", "raw_text_excerpt": "y", "anchors": ["b:9999"]}],
+    }
+    extraction = orchestrator.RawExtraction.model_validate(bad)
+    errors = orchestrator._raw_extraction_grounding_errors(PAPER_ID, extraction)
+    assert len(errors) == 1
+    assert "do not exist in content.md" in errors[0]["message"]
+
+
+def test_raw_extraction_grounding_errors_tolerant_of_whitespace_and_typography(env):
+    # Reuses validate_provenance's own typographic-equivalence/whitespace-
+    # collapse primitives (_value_supported_by_text) -- a real confirmed
+    # false-rejection class (extra rendered whitespace, non-breaking
+    # hyphens, etc.) must not newly reject a genuinely grounded excerpt
+    # here either, exactly as it doesn't for the final IR value.
+    extraction = orchestrator.RawExtraction.model_validate({
+        "paper_id": PAPER_ID, "entity_type": "Citation", "record_id": PAPER_ID,
+        "facts": [{"field_name": "year", "raw_value": "2012",
+                   "raw_text_excerpt": "Published    in   2012.",  # extra whitespace only
+                   "anchors": ["b:0002"]}],
+    })
+    assert orchestrator._raw_extraction_grounding_errors(PAPER_ID, extraction) == []
+
+
+def test_extraction_with_ungrounded_raw_text_excerpt_is_rejected_and_retried(env):
+    bad_extraction = dict(RAW_EXTRACTION)
+    bad_extraction["facts"] = [
+        RAW_EXTRACTION["facts"][0],
+        {"field_name": "year", "raw_value": "2012",
+         "raw_text_excerpt": "This paper was clearly published sometime around the year 2012 or so.",
+         "anchors": ["b:0002"]},
+        RAW_EXTRACTION["facts"][2],
+    ]
+    invoke = make_invoke_sequence([
+        ("extractor", _inv("extractor", bad_extraction)),
+        ("extractor", _inv("extractor", RAW_EXTRACTION)),  # corrected retry: real, literal excerpt
+        ("converter", _inv("converter", valid_citation_payload())),
+        ("ir-validator", _inv("ir-validator", {"verdict": "plausible", "issues": []})),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+    )
+    assert result.status == "ready"
+    record_key = "Citation__" + PAPER_ID
+    attempt1 = run_store.load_json(run_store.record_dir("run1", record_key) / "extraction" / "attempt1.json")
+    assert attempt1["validation_errors"]
+    assert "raw_text_excerpt" in attempt1["validation_errors"][0]["field"]
+
+
+def test_extraction_with_persistently_ungrounded_excerpt_exhausts_attempts_and_errors(env):
+    bad_extraction = {
+        "paper_id": PAPER_ID, "entity_type": "Citation", "record_id": PAPER_ID,
+        "facts": [{"field_name": "title", "raw_value": "A Title",
+                   "raw_text_excerpt": "This text does not appear anywhere in content.md.",
+                   "anchors": ["b:0003"]}],
+    }
+    invoke = make_invoke_sequence([
+        ("extractor", _inv("extractor", bad_extraction)),
+        ("extractor", _inv("extractor", bad_extraction)),
+        ("extractor", _inv("extractor", bad_extraction)),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+    )
+    assert result.status == "error"
+    record_key = "Citation__" + PAPER_ID
+    final = run_store.load_json(run_store.record_dir("run1", record_key) / "final.json")
+    assert "raw evidence grounding failed" in final["message"]
+    # No propose_record/commit_record call should ever have been made.
+    store_file = env["store_root"] / f"{PAPER_ID}.jsonl"
+    assert not store_file.exists()
+
+
+# --------------------------------------------------------------------- #
+# Phase 1.3: extraction-vs-known-table-value cross-check -- catches
+# Extraction attributing a DIFFERENT table cell's value to a candidate
+# that Step C already knows the correct reported value for. See
+# orchestrator._extraction_matches_known_value's own docstring.
+# --------------------------------------------------------------------- #
+
+
+def test_extraction_matches_known_value_true_when_raw_value_contains_it():
+    extraction = orchestrator.RawExtraction.model_validate(RAW_EXTRACTION)
+    assert orchestrator._extraction_matches_known_value("2012", extraction) is True
+
+
+def test_extraction_matches_known_value_true_when_only_excerpt_contains_it():
+    extraction = orchestrator.RawExtraction.model_validate({
+        "paper_id": PAPER_ID, "entity_type": "Observation", "record_id": "o1",
+        "facts": [{"field_name": "value", "raw_value": "see excerpt",
+                   "raw_text_excerpt": "the reported yield was 12.3 kg/ha", "anchors": ["b:0004"]}],
+    })
+    assert orchestrator._extraction_matches_known_value("12.3 kg/ha", extraction) is True
+
+
+def test_extraction_matches_known_value_false_when_absent_everywhere():
+    extraction = orchestrator.RawExtraction.model_validate(RAW_EXTRACTION)
+    assert orchestrator._extraction_matches_known_value("99.9", extraction) is False
+
+
+def test_run_record_rejects_extraction_that_contradicts_known_table_value(env):
+    extraction_with_known_value = dict(RAW_EXTRACTION)
+    extraction_with_known_value["facts"] = RAW_EXTRACTION["facts"] + [
+        {"field_name": "value", "raw_value": "1997", "raw_text_excerpt": "A Title", "anchors": ["b:0003"]},
+    ]
+    invoke = make_invoke_sequence([
+        ("extractor", _inv("extractor", RAW_EXTRACTION)),  # attempt 1: known_value never reported anywhere
+        ("extractor", _inv("extractor", extraction_with_known_value)),  # attempt 2: now present
+        ("converter", _inv("converter", valid_citation_payload())),
+        ("ir-validator", _inv("ir-validator", {"verdict": "plausible", "issues": []})),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+        known_value="1997",
+    )
+    assert result.status == "ready"
+    record_key = "Citation__" + PAPER_ID
+    attempt1 = run_store.load_json(run_store.record_dir("run1", record_key) / "extraction" / "attempt1.json")
+    assert attempt1["validation_errors"]
+    assert "already known to be" in attempt1["validation_errors"][0]["message"]
+    attempt2 = run_store.load_json(run_store.record_dir("run1", record_key) / "extraction" / "attempt2.json")
+    assert attempt2["validation_errors"] == []
+
+
+def test_run_record_known_value_is_a_noop_when_not_a_table_candidate(env):
+    # known_value defaults to None for every non-table-derived candidate --
+    # must never gate anything when absent.
+    invoke = make_invoke_sequence([
+        ("extractor", _inv("extractor", RAW_EXTRACTION)),
+        ("converter", _inv("converter", valid_citation_payload())),
+        ("ir-validator", _inv("ir-validator", {"verdict": "plausible", "issues": []})),
+    ])
+    result = orchestrator.run_record(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Citation", record_id=PAPER_ID,
+        model="test-model", client=env["client"], invoke=invoke, enable_ai_validation=True,
+    )
+    assert result.status == "ready"
+
+
+# --------------------------------------------------------------------- #
 # known_refs -- fixes the "invented UNKNOWN for site_id" failure mode
 # --------------------------------------------------------------------- #
 

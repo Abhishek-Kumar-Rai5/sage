@@ -334,6 +334,21 @@ def test_step_c_not_applicable_produces_no_candidates():
     assert orchestrator._table_classification_to_candidates(tc, {}) == []
 
 
+def test_step_c_sets_known_value_to_the_reported_cell_text():
+    # Phase 1.3 (extraction-vs-known-table-value cross-check): Step C
+    # already knows the exact cell value it cross-produced this candidate
+    # from -- carry it through on known_value so the orchestrator can
+    # later verify Extraction actually read THIS cell, not a different one.
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0001"],
+        value_columns=[TableValueColumn(value_column_id="yield", variable_name_hint="yield")],
+        row_groups=[TableRowGroup(row_group_id="control", source_table_anchor="b:0001",
+                                   factor_values={"Treatment": "control"}, cells={"yield": "  3.2  "})],
+    )
+    candidates = orchestrator._table_classification_to_candidates(tc, {})
+    assert candidates[0].known_value == "3.2"
+
+
 def test_step_c_description_includes_factor_values_site_and_reported_value():
     tc = TableClassification(
         applicable=True, table_anchors=["b:0001"],
@@ -927,6 +942,73 @@ def test_drop_candidates_covered_by_tables_noop_when_nothing_covered():
 
 
 # --------------------------------------------------------------------- #
+# 8b. _dedupe_candidate_record_ids (Phase 1.2: candidate collision
+#     detection) -- table-derived and free-form candidates are generated
+#     by two independent passes and can legitimately choose the same
+#     sanitized candidate_id; neither must ever silently overwrite the
+#     other's run_record() results.
+# --------------------------------------------------------------------- #
+
+def test_dedupe_candidate_record_ids_noop_when_no_collision():
+    candidates = [
+        EnumerationCandidate(candidate_id="a", description="a", anchors=["b:0001"], linked_candidates={}),
+        EnumerationCandidate(candidate_id="b", description="b", anchors=["b:0001"], linked_candidates={}),
+    ]
+    deduped, notes = orchestrator._dedupe_candidate_record_ids(candidates)
+    assert [c.candidate_id for c in deduped] == ["a", "b"]
+    assert notes == []
+
+
+def test_dedupe_candidate_record_ids_disambiguates_exact_string_collision():
+    table_candidate = EnumerationCandidate(
+        candidate_id="ambient_co2", description="from table", anchors=["b:0001"], linked_candidates={},
+    )
+    freeform_candidate = EnumerationCandidate(
+        candidate_id="ambient_co2", description="from prose", anchors=["b:0002"], linked_candidates={},
+    )
+    deduped, notes = orchestrator._dedupe_candidate_record_ids([table_candidate, freeform_candidate])
+    # Neither candidate is dropped or merged -- both survive, distinguished
+    # only by a disambiguated id, never a silent overwrite.
+    assert [c.candidate_id for c in deduped] == ["ambient_co2", "ambient_co2_dup2"]
+    assert deduped[0].description == "from table"
+    assert deduped[1].description == "from prose"
+    assert len(notes) == 1
+    assert "ambient_co2" in notes[0]
+
+
+def test_dedupe_candidate_record_ids_collision_detected_after_sanitization():
+    # The collision that matters is on the record_id actually used, which
+    # is built from the SANITIZED candidate_id -- two raw candidate_ids
+    # that only collide once sanitized must be caught too.
+    a = EnumerationCandidate(candidate_id="Ambient CO2!", description="a", anchors=["b:0001"], linked_candidates={})
+    b = EnumerationCandidate(candidate_id="ambient_co2", description="b", anchors=["b:0002"], linked_candidates={})
+    deduped, notes = orchestrator._dedupe_candidate_record_ids([a, b])
+    assert orchestrator._sanitize_candidate_id(deduped[0].candidate_id) == "ambient_co2"
+    assert orchestrator._sanitize_candidate_id(deduped[1].candidate_id) == "ambient_co2_dup2"
+    assert len(notes) == 1
+
+
+def test_dedupe_candidate_record_ids_handles_three_way_collision():
+    candidates = [
+        EnumerationCandidate(candidate_id="x", description=str(i), anchors=["b:0001"], linked_candidates={})
+        for i in range(3)
+    ]
+    deduped, notes = orchestrator._dedupe_candidate_record_ids(candidates)
+    assert [c.candidate_id for c in deduped] == ["x", "x_dup2", "x_dup3"]
+    assert len(notes) == 2
+
+
+def test_dedupe_candidate_record_ids_preserves_known_value():
+    # model_copy(update=...) must only touch candidate_id -- every other
+    # field (including the Phase 1.3 known_value) carries over unchanged.
+    a = EnumerationCandidate(candidate_id="x", description="a", anchors=["b:0001"], linked_candidates={}, known_value="3.2")
+    b = EnumerationCandidate(candidate_id="x", description="b", anchors=["b:0002"], linked_candidates={}, known_value="4.1")
+    deduped, _ = orchestrator._dedupe_candidate_record_ids([a, b])
+    assert deduped[0].known_value == "3.2"
+    assert deduped[1].known_value == "4.1"
+
+
+# --------------------------------------------------------------------- #
 # 9. _run_multi_record_entity wiring (Step D end-to-end call shape) --
 #    dependency resolution itself is unrelated to what this section
 #    tests, so _resolve_known_refs is monkeypatched to always resolve,
@@ -992,6 +1074,57 @@ def test_run_multi_record_entity_merges_table_and_freeform_candidates_for_observ
     # run_enumeration (the free-form pass) was told what the table pass
     # already covered, so it can steer the model away from re-reporting it.
     assert captured_excluded["value"] == {"b:0006"}
+
+
+def test_run_multi_record_entity_disambiguates_colliding_candidate_ids_instead_of_overwriting(env, monkeypatch):
+    # Phase 1.2 (candidate collision detection): a table-derived candidate
+    # and a free-form candidate independently choosing the SAME
+    # candidate_id must both still be attempted, under distinct record_ids
+    # -- never one silently overwriting the other's run_record() results.
+    monkeypatch.setattr(orchestrator, "_resolve_known_refs", lambda entity_type, records: ({}, None))
+    monkeypatch.setattr(orchestrator, "_multi_record_link_pools", lambda *a, **k: {})
+
+    table_candidate = EnumerationCandidate(
+        candidate_id="ambient_co2", description="from table", anchors=["b:0006"], linked_candidates={},
+    )
+    monkeypatch.setattr(orchestrator, "run_table_enumeration", lambda **kwargs: ([table_candidate], {"b:0006"}))
+
+    freeform_candidate = EnumerationCandidate(
+        candidate_id="ambient_co2", description="from prose", anchors=["b:0007"], linked_candidates={},
+    )
+    monkeypatch.setattr(orchestrator, "run_enumeration", lambda **kwargs: ([freeform_candidate], None))
+    monkeypatch.setattr(
+        orchestrator, "_apply_candidate_links",
+        lambda paper_id, entity_type, this_run_records, known_refs, candidate: known_refs,
+    )
+
+    seen_record_ids = []
+
+    def _fake_run_record(*, entity_type, record_id, **kwargs):
+        seen_record_ids.append(record_id)
+        return orchestrator.RecordResult(
+            status="ready", entity_type=entity_type, record_id=record_id,
+            detail={"payload": {}, "ai_validation": None},
+        )
+
+    monkeypatch.setattr(orchestrator, "run_record", _fake_run_record)
+
+    record_infos = orchestrator._run_multi_record_entity(
+        run_id="run_collide", paper_id=PAPER_ID, entity_type="Observation", model="test-model",
+        client=None, invoke=make_invoke_sequence([]), enable_ai_validation=False, this_run_records={},
+    )
+
+    # Both candidates were attempted, each under its own distinct record_id.
+    assert len(record_infos) == 2
+    assert len(seen_record_ids) == 2
+    assert len(set(seen_record_ids)) == 2
+
+    # The collision itself is disclosed on disk, not just silently resolved.
+    collision_artifact = run_store.load_json(
+        run_store.record_dir("run_collide", "Observation__enumeration") / "candidate_collision" / "attempt1.json"
+    )
+    assert collision_artifact["collisions"]
+    assert "ambient_co2" in collision_artifact["collisions"][0]
 
 
 def test_run_multi_record_entity_skips_table_enumeration_for_non_table_entity_types(env, monkeypatch):
