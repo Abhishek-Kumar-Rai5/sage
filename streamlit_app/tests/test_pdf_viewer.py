@@ -24,8 +24,13 @@ def _render(page_number=1, polygon=None, block_id=None):
 
 def test_renders_a_loop_over_every_pdf_page_not_just_one():
     srcdoc = _render()
-    assert "pdf.numPages" in srcdoc
-    assert "for (let pageIndex = 1; pageIndex <= pdf.numPages; pageIndex++)" in srcdoc
+    # renderAllPages() is called more than once (initial load, and again on
+    # every zoom change via setZoom) -- it must read the page count off the
+    # persistent `pdfDoc` module-level variable, not the transient `pdf`
+    # callback parameter that only exists inside the one-time initial
+    # getDocument().then(...) callback (see pdf_viewer.py:253-257).
+    assert "pdfDoc.numPages" in srcdoc
+    assert "for (let pageIndex = 1; pageIndex <= pdfDoc.numPages; pageIndex++)" in srcdoc
 
 
 def test_holder_has_its_own_independent_vertical_scroll():
