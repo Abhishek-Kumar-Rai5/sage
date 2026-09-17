@@ -16,6 +16,7 @@ depends on, so it must be exercised for real, not mocked.
 """
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -803,6 +804,68 @@ def test_parse_json_block_reports_error_on_garbage():
     parsed, err = orchestrator._parse_json_block("not json, sorry")
     assert parsed is None
     assert err
+
+
+# --------------------------------------------------------------------- #
+# _invoke_agent_once -- TimeoutExpired can hand back raw bytes for
+# stdout/stderr even though subprocess.run() was called with text=True (a
+# real, reproduced CPython behavior: the internal post-kill partial-output
+# capture after a timeout bypasses the normal text-decoding step). Real
+# live crash (TypeError: a bytes-like object is required, not 'str'),
+# surfaced only once table-enumeration's much higher per-run call volume
+# made an actual 300s timeout statistically likely for the first time --
+# _has_malformed_harmony_tool_call's own substring check crashed outright
+# on a bytes stdout.
+# --------------------------------------------------------------------- #
+
+
+def test_decode_if_bytes_normalizes_bytes_leaves_str_and_none_untouched():
+    assert orchestrator._decode_if_bytes(b"hello") == "hello"
+    assert orchestrator._decode_if_bytes("hello") == "hello"
+    assert orchestrator._decode_if_bytes(None) is None
+
+
+def test_invoke_agent_once_survives_timeout_with_bytes_stdout(monkeypatch):
+    # Reproduces the real subprocess shape: TimeoutExpired.stdout is bytes
+    # (some real output was captured before the kill), .stderr is None.
+    def fake_run(cmd, cwd, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=b"partial output before timeout", stderr=None)
+
+    monkeypatch.setattr(orchestrator.subprocess, "run", fake_run)
+
+    result = orchestrator._invoke_agent_once("extractor", "test-model", "p", timeout=5)
+
+    assert result.returncode == -1
+    assert isinstance(result.stdout, str)
+    assert result.stdout == "partial output before timeout"
+    assert "timed out after 5s" in result.stderr
+    assert result.had_malformed_tool_call is False  # must not raise reaching this check
+
+
+def test_invoke_agent_once_survives_timeout_with_bytes_stdout_and_stderr(monkeypatch):
+    def fake_run(cmd, cwd, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=b"some stdout", stderr=b"some stderr")
+
+    monkeypatch.setattr(orchestrator.subprocess, "run", fake_run)
+
+    result = orchestrator._invoke_agent_once("extractor", "test-model", "p", timeout=5)
+    assert result.stdout == "some stdout"
+    assert result.stderr.startswith("some stderr")
+
+
+def test_invoke_agent_once_timeout_with_malformed_tool_call_in_bytes_stdout_still_detected(monkeypatch):
+    # The exact real signature must still be detected correctly even when
+    # it arrived via the bytes-producing TimeoutExpired path, not just the
+    # normal str-producing success path.
+    malformed_bytes = _MALFORMED_TOOL_CALL_STDOUT.encode("utf-8")
+
+    def fake_run(cmd, cwd, capture_output, text, timeout):
+        raise subprocess.TimeoutExpired(cmd=cmd, timeout=timeout, output=malformed_bytes, stderr=None)
+
+    monkeypatch.setattr(orchestrator.subprocess, "run", fake_run)
+
+    result = orchestrator._invoke_agent_once("extractor", "test-model", "p", timeout=5)
+    assert result.had_malformed_tool_call is True
 
 
 # --------------------------------------------------------------------- #
@@ -2022,6 +2085,91 @@ def test_run_enumeration_rejects_linked_candidate_slug_not_in_pool(env):
     )
     assert error is None
     assert candidates[0].linked_candidates == {"treatment_id": "ambient_co2"}
+
+
+# --------------------------------------------------------------------- #
+# _unsplit_required_dimensions / run_enumeration's retry-then-accept
+# (real confirmed cascade: Daren-1997-Canopy Treatment enumeration, run
+# 20260916T200235_5fae474d -- see _unsplit_required_dimensions's own
+# docstring for the full real-evidence explanation).
+# --------------------------------------------------------------------- #
+
+_TWO_SITE_DEPS = [("citation_id", "Citation", True), ("site_id", "Site", True)]
+_TWO_SITE_POOL = {"site_id": [
+    {"slug": "ames_ia", "record_id": "x", "name": "Ames Station"},
+    {"slug": "mead_ne", "record_id": "y", "name": "Mead Station"},
+]}
+
+
+def test_unsplit_required_dimensions_flags_a_required_pool_nothing_links_to(monkeypatch):
+    monkeypatch.setitem(orchestrator.ENTITY_DEPENDENCIES, "Treatment", _TWO_SITE_DEPS)
+    from pipeline.raw_schema import EnumerationCandidate
+    candidates = [EnumerationCandidate(candidate_id="trailblazer", description="x", anchors=["b:1"], linked_candidates={})]
+    flagged = orchestrator._unsplit_required_dimensions("Treatment", candidates, _TWO_SITE_POOL)
+    assert flagged == [("site_id", "Site")]
+
+
+def test_unsplit_required_dimensions_not_flagged_when_one_candidate_links_it(monkeypatch):
+    monkeypatch.setitem(orchestrator.ENTITY_DEPENDENCIES, "Treatment", _TWO_SITE_DEPS)
+    from pipeline.raw_schema import EnumerationCandidate
+    candidates = [
+        EnumerationCandidate(candidate_id="a", description="x", anchors=["b:1"], linked_candidates={}),
+        EnumerationCandidate(candidate_id="b", description="x", anchors=["b:1"], linked_candidates={"site_id": "ames_ia"}),
+    ]
+    assert orchestrator._unsplit_required_dimensions("Treatment", candidates, _TWO_SITE_POOL) == []
+
+
+def test_unsplit_required_dimensions_ignores_optional_fields(monkeypatch):
+    optional_variable_deps = [("citation_id", "Citation", True), ("variable_id", "Variable", False)]
+    monkeypatch.setitem(orchestrator.ENTITY_DEPENDENCIES, "Coverage", optional_variable_deps)
+    from pipeline.raw_schema import EnumerationCandidate
+    candidates = [EnumerationCandidate(candidate_id="a", description="x", anchors=["b:1"], linked_candidates={})]
+    pool = {"variable_id": [{"slug": "v1", "record_id": "x", "name": "V1"}, {"slug": "v2", "record_id": "y", "name": "V2"}]}
+    assert orchestrator._unsplit_required_dimensions("Coverage", candidates, pool) == []
+
+
+def test_run_enumeration_retries_when_required_dimension_never_linked_then_succeeds(env, monkeypatch):
+    monkeypatch.setitem(orchestrator.ENTITY_DEPENDENCIES, "Treatment", _TWO_SITE_DEPS)
+    invoke = make_invoke_sequence([
+        ("extractor", _inv("extractor", {
+            "entity_type": "Treatment",
+            "candidates": [{"candidate_id": "trailblazer", "description": "x", "anchors": ["b:0003"], "linked_candidates": {}}],
+        })),
+        ("extractor", _inv("extractor", {
+            "entity_type": "Treatment",
+            "candidates": [
+                {"candidate_id": "trailblazer_ames", "description": "x", "anchors": ["b:0003"], "linked_candidates": {"site_id": "ames_ia"}},
+                {"candidate_id": "trailblazer_mead", "description": "x", "anchors": ["b:0003"], "linked_candidates": {"site_id": "mead_ne"}},
+            ],
+        })),
+    ])
+    candidates, error = orchestrator.run_enumeration(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Treatment", model="test-model", invoke=invoke,
+        link_pools=_TWO_SITE_POOL,
+    )
+    assert error is None
+    assert len(candidates) == 2
+    assert {c.linked_candidates["site_id"] for c in candidates} == {"ames_ia", "mead_ne"}
+
+
+def test_run_enumeration_accepts_unsplit_result_on_final_attempt_rather_than_erroring(env, monkeypatch):
+    # A paper can legitimately not distinguish by the dimension for every
+    # candidate -- after MAX_ENUMERATION_ATTEMPTS, the result is accepted
+    # as-is (the downstream refuse-to-guess gate remains the real safety
+    # net), never turned into a hard enumeration failure.
+    monkeypatch.setitem(orchestrator.ENTITY_DEPENDENCIES, "Treatment", _TWO_SITE_DEPS)
+    unsplit_payload = {
+        "entity_type": "Treatment",
+        "candidates": [{"candidate_id": "trailblazer", "description": "x", "anchors": ["b:0003"], "linked_candidates": {}}],
+    }
+    invoke = make_invoke_sequence([("extractor", _inv("extractor", unsplit_payload))] * orchestrator.MAX_ENUMERATION_ATTEMPTS)
+    candidates, error = orchestrator.run_enumeration(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Treatment", model="test-model", invoke=invoke,
+        link_pools=_TWO_SITE_POOL,
+    )
+    assert error is None
+    assert len(candidates) == 1
+    assert candidates[0].linked_candidates == {}
 
 
 def test_two_observation_candidates_link_to_different_treatment_variable_pairs(env):

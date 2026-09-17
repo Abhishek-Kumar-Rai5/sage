@@ -269,6 +269,37 @@ def test_match_row_group_empty_factor_values_returns_none():
     assert orchestrator._match_row_group_to_pool({}, [{"slug": "a", "record_id": "...", "name": "A"}]) is None
 
 
+def test_match_row_group_substring_fallback_when_no_exact_match():
+    # Real shape: a Site pool's `name` is the long institution name, never
+    # matchable exactly against a table's short site_hint like "Ames" --
+    # the slug ("ames_ia") DOES contain it as a substring.
+    pool = [{"slug": "ames_ia", "record_id": "...", "name": "Iowa State University Agronomy and Agricultural Engineering Research Center"}]
+    assert orchestrator._match_row_group_to_pool({"Site": "Ames"}, pool) == "ames_ia"
+
+
+def test_match_row_group_substring_fallback_requires_unique_match():
+    pool = [
+        {"slug": "ames_ia", "record_id": "...", "name": "Ames Station"},
+        {"slug": "ames_east", "record_id": "...", "name": "Ames East Station"},
+    ]
+    assert orchestrator._match_row_group_to_pool({"Site": "Ames"}, pool) is None
+
+
+def test_match_row_group_substring_fallback_ignores_very_short_hints():
+    pool = [{"slug": "ab_station", "record_id": "...", "name": "AB Station"}]
+    assert orchestrator._match_row_group_to_pool({"Site": "ab"}, pool) is None
+
+
+def test_match_row_group_prefers_exact_match_over_substring():
+    pool = [
+        {"slug": "ames", "record_id": "...", "name": "Ames"},
+        {"slug": "ames_annex", "record_id": "...", "name": "Ames Annex"},
+    ]
+    # "Ames" exactly matches the first entry; the substring fallback (which
+    # would be ambiguous between both) must never even be consulted.
+    assert orchestrator._match_row_group_to_pool({"Site": "Ames"}, pool) == "ames"
+
+
 # --------------------------------------------------------------------- #
 # 4. _table_classification_to_candidates (Step C, pure cross-product)
 # --------------------------------------------------------------------- #
@@ -340,6 +371,72 @@ def test_step_c_leaves_unlinked_when_no_exact_match():
     )
     candidates = orchestrator._table_classification_to_candidates(tc, pool)
     assert candidates[0].linked_candidates == {}
+
+
+def test_step_c_links_site_id_from_value_column_site_hint():
+    # Real Daren-1997-Canopy shape: site information lives on the VALUE
+    # COLUMN (Table 2's "Ames"/"Mead" sub-columns), not on the row's own
+    # factor_values (Population/Maturity) -- site linking must still work.
+    pool = {"site_id": [{"slug": "ames_ia", "record_id": "...", "name": "Iowa State University Agronomy and Agricultural Engineering Research Center"}]}
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0119"],
+        value_columns=[TableValueColumn(value_column_id="total_yield_ames", variable_name_hint="total yield", site_hint="Ames")],
+        row_groups=[TableRowGroup(row_group_id="trailblazer_veg", source_table_anchor="b:0119",
+                                   factor_values={"Population": "Trailblazer"}, cells={"total_yield_ames": "0.19"})],
+    )
+    candidates = orchestrator._table_classification_to_candidates(tc, pool)
+    assert candidates[0].linked_candidates == {"site_id": "ames_ia"}
+
+
+def test_step_c_does_not_link_site_id_when_no_site_hint():
+    pool = {"site_id": [{"slug": "ames_ia", "record_id": "...", "name": "Ames"}]}
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0001"],
+        value_columns=[TableValueColumn(value_column_id="yield", variable_name_hint="yield")],  # no site_hint
+        row_groups=[TableRowGroup(row_group_id="r", source_table_anchor="b:0001",
+                                   factor_values={"Population": "Trailblazer"}, cells={"yield": "1.0"})],
+    )
+    candidates = orchestrator._table_classification_to_candidates(tc, pool)
+    assert "site_id" not in candidates[0].linked_candidates
+
+
+def test_step_c_links_method_id_from_value_column_method_hint():
+    pool = {"method_id": [{"slug": "hand_clipping_harvest", "record_id": "...", "name": "hand-clipping"}]}
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0001"],
+        value_columns=[TableValueColumn(value_column_id="yield", variable_name_hint="total yield", method_hint="hand-clipping harvest")],
+        row_groups=[TableRowGroup(row_group_id="r", source_table_anchor="b:0001",
+                                   factor_values={"Population": "Trailblazer"}, cells={"yield": "1.0"})],
+    )
+    candidates = orchestrator._table_classification_to_candidates(tc, pool)
+    assert candidates[0].linked_candidates == {"method_id": "hand_clipping_harvest"}
+
+
+def test_match_row_group_resolves_population_and_site_via_scoring_not_flat_match():
+    # Real Daren-1997-Canopy shape: two Treatment pool entries share the
+    # IDENTICAL name ('Trailblazer') -- site information lives only in the
+    # slug. A flat "any value matches" check is ambiguous here; the scored
+    # match correctly picks the entry accounting for BOTH values.
+    pool = [
+        {"slug": "trailblazer_ames", "record_id": "...", "name": "Trailblazer"},
+        {"slug": "trailblazer_mead", "record_id": "...", "name": "Trailblazer"},
+    ]
+    assert orchestrator._match_row_group_to_pool({"Population": "Trailblazer", "Site": "Ames"}, pool) == "trailblazer_ames"
+    assert orchestrator._match_row_group_to_pool({"Population": "Trailblazer", "Site": "Mead"}, pool) == "trailblazer_mead"
+
+
+def test_match_row_group_refuses_a_genuine_tie_rather_than_guessing():
+    # Real architectural case: a split-plot design models Population and
+    # Maturity as SEPARATE Treatment entities. A row carrying both, against
+    # a pool containing one entry per dimension (both equally real, both
+    # equally supported by the row's own values), must not silently prefer
+    # one over the other -- a single treatment_id cannot represent both.
+    pool = [
+        {"slug": "trailblazer_ames", "record_id": "...", "name": "Trailblazer"},
+        {"slug": "vegetative_ames", "record_id": "...", "name": "Vegetative"},
+    ]
+    factor_values = {"Population": "Trailblazer", "Maturity": "Vegetative", "Site": "Ames"}
+    assert orchestrator._match_row_group_to_pool(factor_values, pool) is None
 
 
 # --------------------------------------------------------------------- #
@@ -445,6 +542,38 @@ def test_daren_table2_reconstruction_produces_the_real_expected_candidate_count(
     assert len(cave_in_rock_candidates) == 8
 
 
+def test_daren_table2_treatment_projection_produces_the_real_expected_combinations():
+    """Same real Table 2 reconstruction, projected as Treatment candidates
+    instead of Observation ones: a Treatment is the (Population, Maturity,
+    Site) COMBINATION, deduplicated across the 4 measures reported for
+    each -- 7 logical rows x 2 sites = 14 distinct combinations, not 56
+    (one per measure) and not 9/18 (free-form enumeration's real result,
+    which treated Population and Maturity as separate, uncombined
+    Treatments -- see TABLE_ENUMERATION_ENTITY_TYPES's own module comment
+    for why that was wrong)."""
+    classification = daren_table2_classification()
+    candidates, covered = orchestrator._table_classifications_to_treatment_candidates([classification], {})
+
+    assert len(candidates) == 7 * 2 == 14
+    assert covered == {"b:0119"}
+
+    # candidate_id is built from combo.items() sorted by KEY (alphabetical:
+    # Maturity, Population, Site), so the values appear in that same order.
+    trailblazer_veg_ames = next(
+        c for c in candidates
+        if c.candidate_id == orchestrator._sanitize_candidate_id("Vegetative_Trailblazer_Ames")
+    )
+    assert "Trailblazer" in trailblazer_veg_ames.description
+    assert "Vegetative" in trailblazer_veg_ames.description
+    assert "Ames" in trailblazer_veg_ames.description
+    assert trailblazer_veg_ames.anchors == ["b:0119"]
+
+    # Cave-in-Rock only reports Vegetative in this data -> exactly 2
+    # combinations (one per site), not 6.
+    cave_in_rock = [c for c in candidates if "cave_in_rock" in c.candidate_id.lower()]
+    assert len(cave_in_rock) == 2
+
+
 # --------------------------------------------------------------------- #
 # 6. run_table_classification (Step B, mocked invoke, bounded retry)
 # --------------------------------------------------------------------- #
@@ -452,7 +581,7 @@ def test_daren_table2_reconstruction_produces_the_real_expected_candidate_count(
 def test_run_table_classification_succeeds_first_attempt(env):
     invoke = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
     result, error = orchestrator.run_table_classification(
-        run_id="run1", paper_id=PAPER_ID, entity_type="Observation", seed_table_anchor="b:0006",
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
         other_tables=[], model="test-model", invoke=invoke,
     )
     assert error is None
@@ -470,7 +599,7 @@ def test_run_table_classification_retries_on_invalid_anchor_then_succeeds(env):
         ("extractor", _table_classification_inv(valid_classification_payload())),
     ])
     result, error = orchestrator.run_table_classification(
-        run_id="run1", paper_id=PAPER_ID, entity_type="Observation", seed_table_anchor="b:0006",
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
         other_tables=[], model="test-model", invoke=invoke,
     )
     assert error is None
@@ -487,7 +616,7 @@ def test_run_table_classification_retries_on_sanity_check_failure_then_gives_up(
         ("extractor", _table_classification_inv(dropped)),
     ])
     result, error = orchestrator.run_table_classification(
-        run_id="run1", paper_id=PAPER_ID, entity_type="Observation", seed_table_anchor="b:0006",
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
         other_tables=[], model="test-model", invoke=invoke,
     )
     assert result is None
@@ -501,7 +630,7 @@ def test_run_table_classification_not_applicable_is_accepted_without_sanity_chec
     }
     invoke = make_invoke_sequence([("extractor", _table_classification_inv(payload))])
     result, error = orchestrator.run_table_classification(
-        run_id="run1", paper_id=PAPER_ID, entity_type="Observation", seed_table_anchor="b:0006",
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
         other_tables=[], model="test-model", invoke=invoke,
     )
     assert error is None
@@ -519,11 +648,176 @@ def test_run_table_classification_retries_on_malformed_json(env):
         ("extractor", _table_classification_inv(valid_classification_payload())),
     ])
     result, error = orchestrator.run_table_classification(
-        run_id="run1", paper_id=PAPER_ID, entity_type="Observation", seed_table_anchor="b:0006",
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
         other_tables=[], model="test-model", invoke=invoke,
     )
     assert error is None
     assert result is not None
+
+
+def test_run_table_classification_second_call_uses_cache_no_new_invoke(env):
+    # Entity-agnostic caching: Treatment's turn classifies a table, then
+    # Observation's turn (same run_id, same table) must reuse it for free.
+    first_invoke = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    first_result, first_error = orchestrator.run_table_classification(
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
+        other_tables=[], model="test-model", invoke=first_invoke,
+    )
+    assert first_error is None
+
+    def _fail_if_called(agent, model, prompt, timeout=300):
+        raise AssertionError("a cached table classification must never trigger a new invoke call")
+
+    second_result, second_error = orchestrator.run_table_classification(
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
+        other_tables=[], model="test-model", invoke=_fail_if_called,
+    )
+    assert second_error is None
+    assert second_result.model_dump() == first_result.model_dump()
+
+
+def test_run_table_classification_cache_is_scoped_per_run_id(env):
+    invoke1 = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    orchestrator.run_table_classification(
+        run_id="run1", paper_id=PAPER_ID, seed_table_anchor="b:0006",
+        other_tables=[], model="test-model", invoke=invoke1,
+    )
+    # A DIFFERENT run_id must not see run1's cache -- real invoke required.
+    invoke2 = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    result, error = orchestrator.run_table_classification(
+        run_id="run2", paper_id=PAPER_ID, seed_table_anchor="b:0006",
+        other_tables=[], model="test-model", invoke=invoke2,
+    )
+    assert error is None
+    assert result is not None
+
+
+def test_load_cached_table_classification_missing_file_returns_none(env):
+    assert orchestrator._load_cached_table_classification("run1", "table_classification__b_9999") is None
+
+
+# --------------------------------------------------------------------- #
+# 7. run_table_classification_pass (Steps A + B, entity-agnostic, cached)
+# --------------------------------------------------------------------- #
+
+def test_run_table_classification_pass_returns_classifications_keyed_by_anchor(env):
+    invoke = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    classifications = orchestrator.run_table_classification_pass(
+        run_id="run1", paper_id=PAPER_ID, model="test-model", invoke=invoke,
+    )
+    assert set(classifications.keys()) == {"b:0006"}
+    assert len(classifications["b:0006"].row_groups) == 3
+
+
+def test_run_table_classification_pass_second_call_reuses_cache(env):
+    first_invoke = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    orchestrator.run_table_classification_pass(run_id="run1", paper_id=PAPER_ID, model="test-model", invoke=first_invoke)
+
+    def _fail_if_called(agent, model, prompt, timeout=300):
+        raise AssertionError("a second pass within the same run_id must reuse the cache, not re-invoke")
+
+    classifications = orchestrator.run_table_classification_pass(
+        run_id="run1", paper_id=PAPER_ID, model="test-model", invoke=_fail_if_called,
+    )
+    assert set(classifications.keys()) == {"b:0006"}
+
+
+# --------------------------------------------------------------------- #
+# 7b. _table_classifications_to_treatment_candidates (Step C, Treatment
+#     projection -- a Treatment is the full combination of factor levels,
+#     not any single factor alone; see TABLE_ENUMERATION_ENTITY_TYPES's
+#     own module comment for the real Daren-1997-Canopy evidence).
+# --------------------------------------------------------------------- #
+
+def test_treatment_candidates_single_factor_collapses_to_one_per_level():
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0001"],
+        value_columns=[TableValueColumn(value_column_id="yield", variable_name_hint="yield")],
+        row_groups=[
+            TableRowGroup(row_group_id="control", source_table_anchor="b:0001",
+                          factor_values={"Treatment": "control"}, cells={"yield": "3.2"}),
+            TableRowGroup(row_group_id="n_fert", source_table_anchor="b:0001",
+                          factor_values={"Treatment": "n_fert"}, cells={"yield": "4.1"}),
+        ],
+    )
+    candidates, covered = orchestrator._table_classifications_to_treatment_candidates([tc], {})
+    assert len(candidates) == 2
+    assert covered == {"b:0001"}
+
+
+def test_treatment_candidates_multi_factor_produces_full_combination():
+    # Two factors (Population x Maturity) crossed with two value columns
+    # (Ames/Mead sites) -- the real Daren shape, minimal version.
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0119"],
+        value_columns=[
+            TableValueColumn(value_column_id="yield_ames", variable_name_hint="yield", site_hint="Ames"),
+            TableValueColumn(value_column_id="yield_mead", variable_name_hint="yield", site_hint="Mead"),
+        ],
+        row_groups=[
+            TableRowGroup(row_group_id="trailblazer_veg", source_table_anchor="b:0119",
+                          factor_values={"Population": "Trailblazer", "Maturity": "Vegetative"},
+                          cells={"yield_ames": "0.19", "yield_mead": "0.30"}),
+        ],
+    )
+    candidates, covered = orchestrator._table_classifications_to_treatment_candidates([tc], {})
+    # One row x two site-columns -> two distinct (Population, Maturity, Site) combinations.
+    assert len(candidates) == 2
+    assert covered == {"b:0119"}
+
+
+def test_treatment_candidates_deduplicates_across_value_columns_sharing_the_same_combo():
+    # Four different measures reported for the SAME (Population, Site) --
+    # must yield ONE Treatment candidate, not four.
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0119"],
+        value_columns=[
+            TableValueColumn(value_column_id="total_yield", variable_name_hint="total yield", site_hint="Ames"),
+            TableValueColumn(value_column_id="leaf_blade", variable_name_hint="leaf blade dry wt", site_hint="Ames"),
+            TableValueColumn(value_column_id="leaf_sheath", variable_name_hint="leaf sheath dry wt", site_hint="Ames"),
+            TableValueColumn(value_column_id="stem", variable_name_hint="stem dry wt", site_hint="Ames"),
+        ],
+        row_groups=[
+            TableRowGroup(row_group_id="trailblazer", source_table_anchor="b:0119",
+                          factor_values={"Population": "Trailblazer"},
+                          cells={"total_yield": "0.19", "leaf_blade": "0.13", "leaf_sheath": "0.06", "stem": "0"}),
+        ],
+    )
+    candidates, covered = orchestrator._table_classifications_to_treatment_candidates([tc], {})
+    assert len(candidates) == 1
+    assert covered == {"b:0119"}
+
+
+def test_treatment_candidates_links_site_id_deterministically():
+    pool = {"site_id": [{"slug": "ames_ia", "record_id": "...", "name": "Ames"},
+                         {"slug": "mead_ne", "record_id": "...", "name": "Mead"}]}
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0119"],
+        value_columns=[TableValueColumn(value_column_id="yield_ames", variable_name_hint="yield", site_hint="Ames")],
+        row_groups=[TableRowGroup(row_group_id="trailblazer", source_table_anchor="b:0119",
+                                   factor_values={"Population": "Trailblazer"}, cells={"yield_ames": "0.19"})],
+    )
+    candidates, _covered = orchestrator._table_classifications_to_treatment_candidates([tc], pool)
+    assert candidates[0].linked_candidates == {"site_id": "ames_ia"}
+
+
+def test_treatment_candidates_not_applicable_classification_contributes_nothing():
+    tc = TableClassification(applicable=False, reason="not treatment data", table_anchors=["b:0001"])
+    candidates, covered = orchestrator._table_classifications_to_treatment_candidates([tc], {})
+    assert candidates == []
+    assert covered == set()
+
+
+def test_treatment_candidates_blank_cell_produces_no_candidate():
+    tc = TableClassification(
+        applicable=True, table_anchors=["b:0001"],
+        value_columns=[TableValueColumn(value_column_id="yield", variable_name_hint="yield")],
+        row_groups=[TableRowGroup(row_group_id="r", source_table_anchor="b:0001",
+                                   factor_values={"Population": "Trailblazer"}, cells={"yield": None})],
+    )
+    candidates, covered = orchestrator._table_classifications_to_treatment_candidates([tc], {})
+    assert candidates == []
+    assert covered == set()
 
 
 # --------------------------------------------------------------------- #
@@ -578,6 +872,36 @@ def test_run_table_enumeration_no_table_blocks_returns_empty(env, tmp_path, monk
     )
     assert candidates == []
     assert covered == set()
+
+
+def test_run_table_enumeration_treatment_dispatch_produces_deduplicated_combinations(env):
+    invoke = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    candidates, covered = orchestrator.run_table_enumeration(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Treatment", model="test-model", invoke=invoke,
+    )
+    # valid_classification_payload has 3 row_groups x 1 value_column -> 3
+    # distinct single-factor Treatment combinations (no site_hint set).
+    assert len(candidates) == 3
+    assert covered == {"b:0006"}
+
+
+def test_run_table_enumeration_treatment_and_observation_share_one_classification_pass(env):
+    # The SAME table classified once, then projected two different ways --
+    # confirms Treatment's turn and Observation's turn (same run_id) never
+    # trigger a second real classification call for the same table.
+    invoke = make_invoke_sequence([("extractor", _table_classification_inv(valid_classification_payload()))])
+    treatment_candidates, _ = orchestrator.run_table_enumeration(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Treatment", model="test-model", invoke=invoke,
+    )
+
+    def _fail_if_called(agent, model, prompt, timeout=300):
+        raise AssertionError("Observation's turn must reuse Treatment's already-cached classification")
+
+    observation_candidates, _ = orchestrator.run_table_enumeration(
+        run_id="run1", paper_id=PAPER_ID, entity_type="Observation", model="test-model", invoke=_fail_if_called,
+    )
+    assert len(treatment_candidates) == 3
+    assert len(observation_candidates) == 3  # same 3 row_groups x 1 value_column, different projection shape
 
 
 # --------------------------------------------------------------------- #
@@ -670,7 +994,10 @@ def test_run_multi_record_entity_merges_table_and_freeform_candidates_for_observ
     assert captured_excluded["value"] == {"b:0006"}
 
 
-def test_run_multi_record_entity_skips_table_enumeration_for_non_observation_types(env, monkeypatch):
+def test_run_multi_record_entity_skips_table_enumeration_for_non_table_entity_types(env, monkeypatch):
+    # Treatment and Observation both use table enumeration now (see
+    # TABLE_ENUMERATION_ENTITY_TYPES) -- Variable is the control case that
+    # must NOT trigger it.
     monkeypatch.setattr(orchestrator, "_resolve_known_refs", lambda entity_type, records: ({}, None))
     monkeypatch.setattr(orchestrator, "_multi_record_link_pools", lambda *a, **k: {})
 
@@ -681,7 +1008,7 @@ def test_run_multi_record_entity_skips_table_enumeration_for_non_observation_typ
     monkeypatch.setattr(orchestrator, "run_enumeration", lambda **kwargs: ([], None))
 
     record_infos = orchestrator._run_multi_record_entity(
-        run_id="run1", paper_id=PAPER_ID, entity_type="Treatment", model="test-model",
+        run_id="run1", paper_id=PAPER_ID, entity_type="Variable", model="test-model",
         client=None, invoke=make_invoke_sequence([]), enable_ai_validation=False, this_run_records={},
     )
     assert record_infos == []

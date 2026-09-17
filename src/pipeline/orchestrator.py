@@ -119,11 +119,27 @@ MAX_TABLE_CLASSIFICATION_ATTEMPTS = 3
 # table-enumeration design review) directly attacks this by moving the
 # combinatorial "how many distinct ones exist" arithmetic from the model's
 # own free-form judgment into code, which cannot lose count or summarize.
-# Scoped to Observation only for now -- Treatment/Variable/Coverage/etc.
-# stay on the existing free-form-only enumeration until real evidence
-# (the same audit discipline used to find this problem) shows they need
-# it too.
-TABLE_ENUMERATION_ENTITY_TYPES = {"Observation"}
+# Treatment generalization (real evidence, same run): free-form Treatment
+# enumeration split "Population" and "Maturity" into two flatly separate
+# sets of Treatments (site-corrected: 18 total), leaving no single
+# Treatment able to represent a value genuinely about a combination of
+# both -- a real Observation candidate scored an exact tie between its
+# matching population-Treatment and maturity-Treatment, correctly
+# refusing to guess which one to use. The general principle (a Treatment
+# is the FULL combination of factor levels applied to one unit, not any
+# one factor alone -- true for any paper crossing more than one factor,
+# not specific to this one) is exactly what the SAME table reconstruction
+# already used for Observation also expresses: row_group.factor_values +
+# value_column.site_hint IS that combination. Reusing it for Treatment
+# (see _table_classifications_to_treatment_candidates) removes a second,
+# independent free-form guess at the same structure entirely, rather than
+# trying to prompt-engineer free-form Treatment enumeration into reliably
+# discovering the same combinations on its own -- the exact failure mode
+# already confirmed for Observation before Steps A-D existed.
+# Still scoped to Treatment/Observation only -- Variable/Coverage/etc.
+# stay on free-form enumeration until real evidence (the same audit
+# discipline used to find this problem) shows they need it too.
+TABLE_ENUMERATION_ENTITY_TYPES = {"Treatment", "Observation"}
 
 
 # --------------------------------------------------------------------------- #
@@ -200,6 +216,16 @@ def _has_malformed_harmony_tool_call(stdout: str) -> bool:
     return "<|channel|>" in stdout and "unavailable tool" in stdout
 
 
+def _decode_if_bytes(value: Optional[Any]) -> Optional[str]:
+    """`subprocess.TimeoutExpired.stdout`/`.stderr` can be raw bytes even
+    when the original `subprocess.run()` call used `text=True` -- see the
+    real confirmed case in `_invoke_agent_once`'s own TimeoutExpired
+    handler. Normalizes back to str (or leaves None/str untouched) so
+    every downstream string operation is safe regardless of which path
+    produced the value."""
+    return value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+
+
 def _invoke_agent_once(agent: str, model: str, prompt: str, timeout: int) -> AgentInvocation:
     """Exactly one real `opencode run` subprocess call and parse attempt --
     factored out of invoke_agent so its internal empty-response retry loop
@@ -219,8 +245,20 @@ def _invoke_agent_once(agent: str, model: str, prompt: str, timeout: int) -> Age
         returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as exc:
         returncode = -1
-        stdout = exc.stdout or ""
-        stderr = (exc.stderr or "") + f"\n[orchestrator] timed out after {timeout}s"
+        # Confirmed real CPython behavior (reproduced directly): when the
+        # subprocess produced SOME output before timing out,
+        # TimeoutExpired.stdout/.stderr come back as raw BYTES even though
+        # text=True was passed to subprocess.run() -- the internal
+        # post-kill partial-output capture bypasses the normal text-
+        # decoding step. This was latent until table-enumeration's much
+        # higher per-run call volume (hundreds of Observation candidates
+        # instead of a dozen) made an actual 300s timeout statistically
+        # likely for the first time in a live run -- the real crash it
+        # caused: _has_malformed_harmony_tool_call's own substring check
+        # ("<|channel|>" in stdout) raises `TypeError: a bytes-like object
+        # is required, not 'str'` outright if stdout is bytes, not str.
+        stdout = _decode_if_bytes(exc.stdout) or ""
+        stderr = (_decode_if_bytes(exc.stderr) or "") + f"\n[orchestrator] timed out after {timeout}s"
     except FileNotFoundError as exc:
         return AgentInvocation(
             agent=agent, model=model, prompt=prompt, returncode=-1, stdout="", stderr=str(exc),
@@ -513,7 +551,16 @@ _ENTITY_IDENTITY_GUIDANCE: dict[str, str] = {
         "sentences or a table to count as 'clear, specific evidence they are different'; a real "
         "run merged 'ambient' and 'elevated' CO2 into one candidate because they were named in one "
         "sentence, while a standalone test on the same paper correctly split them -- the level of "
-        "the writing (prose vs. table) must not change how many distinct Treatments exist."
+        "the writing (prose vs. table) must not change how many distinct Treatments exist. "
+        "`site_id` is REQUIRED and a single value -- if the paper's experiment is conducted at MORE "
+        "THAN ONE site/location and the same factor levels are applied at each one (a real confirmed "
+        "case, Daren-1997-Canopy: six switchgrass populations each grown at BOTH Ames, IA and Mead, "
+        "NE), the SAME factor level at each site is a SEPARATE Treatment candidate -- e.g. "
+        "'Trailblazer at Ames' and 'Trailblazer at Mead' are two candidates, not one, each linked via "
+        "linked_candidates['site_id'] to its own site. Reporting one candidate per factor level "
+        "regardless of site, leaving site_id unlinked because 'the paper doesn't distinguish', is "
+        "only correct when the paper genuinely never applies that level at more than one site -- "
+        "check this explicitly whenever more than one site exists, don't default to skipping it."
     ),
     "Observation": (
         "An Observation is ONE reported value for ONE combination of (variable, treatment/group, "
@@ -580,7 +627,11 @@ _ENTITY_IDENTITY_GUIDANCE: dict[str, str] = {
         "one site/variable combination), not something a paper's prose typically states directly -- "
         "only report a candidate when the paper contains an explicit statement about how much data "
         "exists (e.g. 'daily measurements were taken over 3 years'); do not infer a Coverage record "
-        "merely because Observations for that site/variable exist elsewhere in this run."
+        "merely because Observations for that site/variable exist elsewhere in this run. `site_id` is "
+        "REQUIRED and a single value -- ONE SITE per Coverage candidate: if the paper conducts the "
+        "same data collection at more than one site (e.g. two field stations), that is ONE Coverage "
+        "candidate PER SITE, each linked via linked_candidates['site_id'] to its own site, never one "
+        "candidate covering multiple sites at once."
     ),
 }
 
@@ -679,6 +730,46 @@ def _enumeration_prompt(
     return base
 
 
+def _unsplit_required_dimensions(
+    entity_type: str, candidates: list, link_pools: Optional[dict[str, list[dict]]],
+) -> list[tuple[str, str]]:
+    """Detects a real, confirmed failure pattern (Daren-1997-Canopy,
+    Treatment enumeration, run 20260916T200235_5fae474d): a paper with
+    more than one ready Site applies the SAME factor levels at every site
+    (e.g. all 6 switchgrass populations grown at both Ames AND Mead), but
+    enumeration reported each level as ONE candidate rather than splitting
+    per site -- none of the candidates could then link `site_id` to a
+    specific one (correctly, per the "never guess when the paper does not
+    make the link explicit" rule), leaving `site_id` genuinely ambiguous
+    for every candidate. The refuse-to-guess gate downstream then
+    correctly refuses ALL of them, which can cascade into blocking every
+    entity type that depends on this one (the real run: zero ready
+    Treatments blocked both Observation and TreatmentPair entirely, even
+    though nothing else was wrong).
+
+    Returns [(field, prereq_type), ...] for every REQUIRED dependency
+    field whose link_pool is genuinely ambiguous (>1 ready candidate --
+    `_multi_record_link_pools` only ever builds a pool in that case to
+    begin with) but which NOT ONE candidate linked to. This is a RETRY
+    SIGNAL, not a hard failure: a paper can legitimately not distinguish
+    by this dimension for every candidate of this entity type, so the
+    caller only asks the model to double-check, never blocks acceptance
+    of the result once attempts are exhausted."""
+    if not link_pools:
+        return []
+    required_fields = {
+        field: prereq_type
+        for field, prereq_type, required in ENTITY_DEPENDENCIES.get(entity_type, [])
+        if required
+    }
+    return [
+        (field, required_fields[field])
+        for field, pool in link_pools.items()
+        if field in required_fields
+        and not any(field in (c.linked_candidates or {}) for c in candidates)
+    ]
+
+
 def run_enumeration(
     *, run_id: str, paper_id: str, entity_type: str, model: str,
     invoke: Callable[..., AgentInvocation] = invoke_agent,
@@ -775,6 +866,41 @@ def run_enumeration(
             artifact["validation_errors"] = errors
             run_store.save_stage_attempt(run_id, record_key, "enumeration", attempt, artifact)
             last_message = f"attempt {attempt}: invalid linked_candidates: {errors}"
+            continue
+
+        # Real confirmed cascade (Daren-1997-Canopy, Treatment enumeration,
+        # run 20260916T200235_5fae474d): give the model ONE chance to
+        # double-check before accepting candidates that leave a genuinely
+        # ambiguous REQUIRED dimension unsplit -- see
+        # _unsplit_required_dimensions's own docstring. Only while attempts
+        # remain: on the final attempt, accept whatever was produced rather
+        # than erroring out entirely (the downstream refuse-to-guess gate
+        # remains the real safety net either way; this is purely a chance
+        # to avoid the cascade, never a hard requirement).
+        unsplit_dims = _unsplit_required_dimensions(entity_type, validated.candidates, link_pools)
+        if unsplit_dims and attempt < MAX_ENUMERATION_ATTEMPTS:
+            errors = [
+                {
+                    "field": "linked_candidates",
+                    "message": (
+                        f"This paper has more than one real, ready {prereq_type} "
+                        f"({sorted(item['slug'] for item in link_pools[field])}), but NONE of your "
+                        f"candidates linked {field!r} to a specific one. If the paper reports or "
+                        f"applies the same {entity_type} at more than one {prereq_type.lower()} "
+                        f"separately (a common pattern -- e.g. a multi-{prereq_type.lower()} "
+                        f"experiment applying the same factor levels at each one), each "
+                        f"{prereq_type.lower()}'s occurrence is a SEPARATE candidate: split further "
+                        f"and link each one via linked_candidates[{field!r}]. If, having checked, the "
+                        f"paper genuinely does not distinguish by {prereq_type.lower()} here, leave "
+                        f"it unlinked as before -- this is a prompt to double-check, not a requirement "
+                        f"to force a link that doesn't exist."
+                    ),
+                }
+                for field, prereq_type in unsplit_dims
+            ]
+            artifact["validation_errors"] = errors
+            run_store.save_stage_attempt(run_id, record_key, "enumeration", attempt, artifact)
+            last_message = f"attempt {attempt}: candidates not split by required dimension(s): {[f for f, _ in unsplit_dims]}"
             continue
 
         artifact["validation_errors"] = []
@@ -884,22 +1010,35 @@ def _table_classification_sanity_check(classification: TableClassification, pape
 
 
 def _table_classification_prompt(
-    paper_id: str, entity_type: str, seed_table_anchor: str, other_tables: list[dict],
+    paper_id: str, seed_table_anchor: str, other_tables: list[dict],
     prior_errors: Optional[list[dict]] = None,
 ) -> str:
     """Step B's prompt: a MUCH narrower ask than free-form enumeration --
     "reconstruct the real row-by-row structure of THIS one table", not
     "enumerate every {entity_type} in the whole paper". Reuses the same
     extractor agent and content.md tools already available (read_table,
-    read_table_row, read_table_cell) -- no new agent, no new tool."""
+    read_table_row, read_table_cell) -- no new agent, no new tool.
+
+    Deliberately entity-agnostic (no entity_type parameter): this
+    reconstruction is a paper-level, shared structural fact -- which
+    experimental conditions this table reports, and what values it gives
+    for each -- not something that differs depending on which entity type
+    (Treatment, Observation, ...) will eventually consume it. Computed
+    ONCE per table per run (see run_table_classification's own on-disk
+    cache) and projected into whatever entity-specific candidates a caller
+    needs (see run_table_enumeration's Treatment vs Observation
+    projections) -- this keeps that projection provably consistent instead
+    of two separate passes independently guessing at the same table."""
     other_lines = "\n".join(
         f"  - {t['table_anchor']} (page {t.get('page')}, section {t.get('section_path')})"
         for t in other_tables
     ) or "  (none)"
     base = (
         f"Reconstruct the FULL row-by-row structure of the table at content.md anchor "
-        f"'{seed_table_anchor}' in paper_id=`{paper_id}`, for the purpose of enumerating every "
-        f"distinct {entity_type} it reports.\n\n"
+        f"'{seed_table_anchor}' in paper_id=`{paper_id}` -- which experimental condition(s) each row "
+        f"represents, and what value(s) it reports for each -- for use identifying both the "
+        f"distinct experimental conditions/treatments this table covers AND the distinct "
+        f"individual values it reports.\n\n"
         f"Use read_table/read_table_row/read_table_cell (passing paper_id=`{paper_id}` and this "
         f"table_anchor) to read the table's REAL rendered markdown AND its raw per-cell "
         f"row_index/col_index data. Read BOTH -- they can disagree (a raw geometric cell can "
@@ -908,15 +1047,30 @@ def _table_classification_prompt(
         f"rows together when a footnote breaks up a table's visual layout on the page). When they "
         f"disagree, reconstruct the CORRECT row-by-row breakdown yourself using both as evidence -- "
         f"never trust raw row_index groupings uncritically.\n\n"
+        f"ALSO call read_nearby(paper_id=`{paper_id}`, anchor='{seed_table_anchor}', before=2) to read "
+        f"this table's own caption (the block immediately preceding it) -- captions spell out "
+        f"abbreviations in full (e.g. 'mean stage by count (MSC)') and this is often the ONLY place "
+        f"they are, which matters because a table's own column headers can themselves be rendered "
+        f"split/garbled by the source PDF extraction (a real confirmed case: a 'MSC' header rendered "
+        f"as two separate raw cells reading 'M.' and 'SC' -- use the caption to recognize this and "
+        f"label the resulting value_column with the REAL name, not the garbled fragment).\n\n"
+        f"A factor/label cell (e.g. a Location or Population column) that is BLANK, or contains text "
+        f"unrelated to any real label the table could possibly mean (a rendering artifact -- a real "
+        f"confirmed case: a Location cell rendered as the literal garbage text 'CONTRACTOR "
+        f"DESCRIPTION' where a location name belonged), is very likely a VERTICALLY-MERGED cell: "
+        f"many real tables state a label ONCE at the top of a group of rows it applies to, leaving "
+        f"every row below it blank in the source layout until the next real label appears. In that "
+        f"case, use the most recent REAL, legible label above it in that same column, never the "
+        f"blank/garbled text itself and never a guess unrelated to the table's actual structure.\n\n"
         f"Other table blocks in this paper (for reference only -- read one of these with "
         f"read_table/read_table_row ONLY if you determine, from its own content, that it is a "
         f"page-split CONTINUATION of the SAME table as '{seed_table_anchor}': same columns, "
         f"immediately following page, no new caption of its own):\n{other_lines}\n\n"
         f"Output ONLY a TableClassification JSON object with exactly these top-level keys: "
         f"applicable, reason, table_anchors, value_columns, row_groups.\n\n"
-        f"- applicable: false if this table does not report per-instance {entity_type} values at "
-        f"all (e.g. a regression-equation table, a table of statistical test results) -- true "
-        f"otherwise.\n"
+        f"- applicable: false if this table does not report per-instance measured values broken "
+        f"out by experimental condition at all (e.g. a regression-equation table, a table of "
+        f"statistical test results) -- true otherwise.\n"
         f"- reason: REQUIRED (a real, specific sentence) when applicable=false, or when "
         f"applicable=true but you cannot confidently reconstruct row_groups (a genuinely garbled or "
         f"ambiguous table) -- otherwise may be omitted/null.\n"
@@ -925,10 +1079,14 @@ def _table_classification_prompt(
         f"above.\n"
         f"- value_columns: one entry per column that reports an actual measured value (never a "
         f"factor/label column like Population or Maturity), each "
-        f"{{value_column_id, variable_name_hint, units_hint, site_hint}} -- value_column_id is a "
-        f"short unique slug you choose; variable_name_hint combines multi-level headers if the "
-        f"table has them (e.g. a 'Total yield' header spanning 'Ames'/'Mead' sub-columns becomes "
-        f"TWO value_columns, one per site, each with site_hint set).\n"
+        f"{{value_column_id, variable_name_hint, units_hint, site_hint, method_hint}} -- "
+        f"value_column_id is a short unique slug you choose; variable_name_hint combines "
+        f"multi-level headers if the table has them (e.g. a 'Total yield' header spanning "
+        f"'Ames'/'Mead' sub-columns becomes TWO value_columns, one per site, each with site_hint "
+        f"set). method_hint is REQUIRED whenever the paper's Methods section (use read_section to "
+        f"check it) names how this specific column's values were actually measured -- e.g. 'hand-"
+        f"clipping harvest', 'LI-COR LAI-2000 leaf area analyzer', 'forced-draft oven at 55C' -- "
+        f"omit only when the paper genuinely never describes a method for this measurement.\n"
         f"- row_groups: one entry per LOGICAL data row (after splitting any packed cells -- see "
         f"above), each {{row_group_id, factor_values, source_table_anchor, cells}} -- factor_values "
         f'is e.g. {{"Population": "Trailblazer", "Maturity": "Vegetative"}}; source_table_anchor is '
@@ -946,8 +1104,31 @@ def _table_classification_prompt(
     return base
 
 
+def _load_cached_table_classification(run_id: str, record_key: str) -> Optional[TableClassification]:
+    """Table classification (Step B) is entity-agnostic and paper-level --
+    computed once per table per run_id, reused across every entity type
+    that needs it (Treatment's turn, then Observation's turn later), never
+    spending a second real LLM call on the exact same table. Checked via
+    the same run_store.save_final convention every other terminal stage
+    result already uses (see run_table_classification's own success path)
+    -- just read back before deciding whether any new work is needed."""
+    path = run_store.record_dir(run_id, record_key) / "final.json"
+    if not path.is_file():
+        return None
+    try:
+        data = run_store.load_json(path)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("status") != "success":
+        return None
+    try:
+        return TableClassification.model_validate(data["classification"])
+    except (KeyError, ValidationError):
+        return None
+
+
 def run_table_classification(
-    *, run_id: str, paper_id: str, entity_type: str, seed_table_anchor: str,
+    *, run_id: str, paper_id: str, seed_table_anchor: str,
     other_tables: list[dict], model: str, invoke: Callable[..., AgentInvocation] = invoke_agent,
 ) -> tuple[Optional[TableClassification], Optional[str]]:
     """Step B: bounded, deterministically-validated classification/
@@ -955,15 +1136,26 @@ def run_table_classification(
     shape (same MAX_*_ATTEMPTS-bounded retry-with-feedback loop, same
     "never trust the model's own anchor claim" re-check against real
     content.md), plus one extra check neither shape validation nor the
-    anchor check alone can catch: _table_classification_sanity_check."""
-    record_key = f"{entity_type}__table_classification__{seed_table_anchor.replace(':', '_')}"
+    anchor check alone can catch: _table_classification_sanity_check.
+
+    Entity-agnostic and cached on disk per (run_id, table): a second call
+    for the same table within the same run (e.g. Observation's turn,
+    after Treatment's turn already classified it) returns the cached
+    result with no new LLM call at all -- see
+    _load_cached_table_classification."""
+    record_key = f"table_classification__{seed_table_anchor.replace(':', '_')}"
+
+    cached = _load_cached_table_classification(run_id, record_key)
+    if cached is not None:
+        return cached, None
+
     errors: list[dict] = []
     last_message = "table classification never produced a valid TableClassification"
 
     for attempt in range(1, MAX_TABLE_CLASSIFICATION_ATTEMPTS + 1):
         result = invoke(
             "extractor", model,
-            _table_classification_prompt(paper_id, entity_type, seed_table_anchor, other_tables, errors),
+            _table_classification_prompt(paper_id, seed_table_anchor, other_tables, errors),
         )
         artifact = result.as_artifact()
 
@@ -1027,6 +1219,7 @@ def run_table_classification(
 
         artifact["validation_errors"] = []
         run_store.save_stage_attempt(run_id, record_key, "table_classification", attempt, artifact)
+        run_store.save_final(run_id, record_key, {"status": "success", "classification": validated.model_dump()})
         return validated, None
 
     run_store.save_final(run_id, record_key, {"status": "error", "message": last_message})
@@ -1038,34 +1231,79 @@ def _normalize_for_matching(text: str) -> str:
 
 
 def _match_row_group_to_pool(factor_values: dict[str, str], pool: list[dict]) -> Optional[str]:
-    """Deterministically match a table row's own factor values (e.g.
-    {'Population': 'Trailblazer'}) against a link_pool entry's `name` or
-    `slug` (the SAME pools `_multi_record_link_pools` already builds for
-    the free-form pass) -- an EXACT match only (after normalizing case/
-    punctuation/whitespace), deliberately NOT fuzzy/substring matching.
+    """Deterministically match a table row's own known values (factor
+    values plus any site_hint/method_hint merged in by the caller) against
+    a link_pool entry's `name` or `slug` (the SAME pools
+    `_multi_record_link_pools` already builds for the free-form pass).
+
+    SCORES each pool entry by how many of the row's normalized values it
+    accounts for (exact match against `name`/`slug`, or substring
+    containment for values >=3 characters -- a `name` field is often a
+    long institution name, e.g. 'Iowa State University Agronomy and
+    Agricultural Engineering Research Center', that an exact match could
+    never reach; an exact match outweighs a substring one, 2 points vs 1),
+    then returns the slug of the entry with the STRICTLY HIGHEST score, or
+    None if the best score is 0 or tied.
+
+    This combined scoring (not a flat "any value matches" check) is what
+    correctly resolves a real, confirmed ambiguity: Daren-1997-Canopy's
+    Treatment pool has BOTH 'trailblazer_ames' and 'trailblazer_mead'
+    sharing the identical name 'Trailblazer' (site lives only in the
+    slug) -- a row with {'Population': 'Trailblazer', 'Site': 'Ames'}
+    scores 'trailblazer_ames' at 3 (exact match on 'trailblazer' + a
+    substring match on 'ames') and 'trailblazer_mead' at 2 (only the exact
+    population match), so the higher-scoring entry wins outright, without
+    requiring every value to match (a row
+    that ALSO carries an unrelated value, e.g. Maturity while matching
+    against the Site pool, simply never scores from that irrelevant value
+    on any entry -- it does not dilute a real match on Site elsewhere).
+    A genuine tie is preserved as unresolved rather than picked arbitrarily
+    -- e.g. the SAME row's Population+Maturity+Site values against a
+    Treatment pool that separately has 'trailblazer_ames' AND
+    'vegetative_ames' (population-level and maturity-level Treatments,
+    both real, both score 3) correctly returns None: a single treatment_id
+    genuinely cannot represent both dimensions at once, and this function
+    must not silently pick one and discard the other.
+
     A wrong link here is far more dangerous than an unlinked candidate: an
     unmatched candidate still goes through the existing
     _apply_candidate_links/refuse-to-guess-gate machinery downstream
     unchanged (a required field falls back to the allowed-set safety net,
     an optional one is simply omitted), so failing to match is always
     safe -- a WRONG match would silently attach a value to the wrong
-    Treatment, exactly the real failure class the refuse-to-guess gate
-    exists to prevent. In practice this fires only when a table's own
-    label happens to match a Treatment's name closely (e.g. both say
-    'Trailblazer' verbatim) -- a real but modest fraction of cases, not
-    a general-purpose fuzzy matcher; most row groups fall through to the
-    existing downstream mechanism, which is the intended, safe default."""
+    record, exactly the real failure class the refuse-to-guess gate exists
+    to prevent."""
     if not factor_values:
         return None
     normalized_values = {_normalize_for_matching(v) for v in factor_values.values() if v} - {""}
     if not normalized_values:
         return None
-    matches = {
-        item["slug"] for item in pool
-        if normalized_values & {_normalize_for_matching(item.get("name") or ""),
-                                 _normalize_for_matching(item["slug"].replace("_", " "))} - {""}
-    }
-    return next(iter(matches)) if len(matches) == 1 else None
+
+    pool_texts = [
+        (item["slug"], {_normalize_for_matching(item.get("name") or ""),
+                         _normalize_for_matching(item["slug"].replace("_", " "))} - {""})
+        for item in pool
+    ]
+
+    def _score(texts: set[str]) -> int:
+        # An exact match (2 points) outweighs a mere substring match (1
+        # point) -- e.g. a row's site_hint 'Ames' exactly matching a real
+        # Site named 'Ames' must win outright over it merely being a
+        # substring of an unrelated 'Ames Annex' entry.
+        total = 0
+        for value in normalized_values:
+            if value in texts:
+                total += 2
+            elif len(value) >= 3 and any(value in text for text in texts):
+                total += 1
+        return total
+
+    scored = [(slug, _score(texts)) for slug, texts in pool_texts]
+    best_score = max((s for _, s in scored), default=0)
+    if best_score == 0:
+        return None
+    winners = [slug for slug, s in scored if s == best_score]
+    return winners[0] if len(winners) == 1 else None
 
 
 def _table_classification_to_candidates(
@@ -1101,9 +1339,22 @@ def _table_classification_to_candidates(
                 description += f" at {value_column.site_hint}"
             description += f" (reported value: {cell_text.strip()})"
 
+            # Site and method information are often column-encoded, not
+            # row-encoded (real Daren-1997-Canopy case: Table 2's "Ames"/
+            # "Mead" sub-columns), so they live on value_column.site_hint/
+            # method_hint, not row.factor_values -- merge them in under
+            # distinct keys so linking works the same deterministic way as
+            # any other factor, rather than only ever landing in the
+            # description text.
+            match_values = dict(row.factor_values or {})
+            if value_column.site_hint:
+                match_values.setdefault("Site", value_column.site_hint)
+            if value_column.method_hint:
+                match_values.setdefault("Method", value_column.method_hint)
+
             linked_candidates: dict[str, str] = {}
             for field, pool in (link_pools or {}).items():
-                match = _match_row_group_to_pool(row.factor_values or {}, pool)
+                match = _match_row_group_to_pool(match_values, pool)
                 if match:
                     linked_candidates[field] = match
 
@@ -1117,35 +1368,37 @@ def _table_classification_to_candidates(
     return candidates
 
 
-def run_table_enumeration(
-    *, run_id: str, paper_id: str, entity_type: str, model: str,
-    invoke: Callable[..., AgentInvocation] = invoke_agent,
-    link_pools: Optional[dict[str, list[dict]]] = None,
-) -> tuple[list[EnumerationCandidate], set[str]]:
-    """Steps A + B + C: discover every Table block (Step A, pure code),
-    classify/reconstruct each not-yet-consumed one (Step B), and
-    deterministically cross-product a valid, sane classification into
-    candidates (Step C). Returns (candidates, covered_table_anchors) --
-    covered_table_anchors is EXACTLY the set of anchors that actually
-    produced >=1 real candidate, never every classified-applicable anchor
-    (see the applicable/row_groups check below): the caller (Step D, in
-    _run_multi_record_entity) uses this to tell the free-form enumeration
-    pass what NOT to re-report, and a table this function gave up on
-    should remain fully available to that fallback pass, not silently
-    suppressed everywhere.
+def run_table_classification_pass(
+    *, run_id: str, paper_id: str, model: str, invoke: Callable[..., AgentInvocation] = invoke_agent,
+) -> dict[str, TableClassification]:
+    """Steps A + B, entity-agnostic and computed ONCE per run: discovers
+    every Table block (Step A, pure code) and classifies/reconstructs each
+    not-yet-consumed one (Step B). Cached to disk per table (see
+    run_table_classification's own cache), so calling this a SECOND time
+    within the same run_id -- e.g. Treatment's turn, then Observation's
+    turn later -- costs no new real LLM calls for tables already done.
 
-    Never raises and never blocks the rest of enumeration on one table's
+    Returns {seed_table_anchor: TableClassification} for every table that
+    successfully classified as applicable with real row_groups. Callers
+    project this SAME shared structure into whatever entity-specific
+    candidates they need (see run_table_enumeration): Treatment gets the
+    deduplicated set of distinct factor-level combinations that actually
+    co-occur; Observation gets the full row x value-column cross-product.
+    Deriving both from the identical reconstruction means they are
+    provably consistent with each other -- never two separate free-form
+    passes independently guessing at the same table and possibly
+    disagreeing.
+
+    Never raises and never blocks the rest of the pass on one table's
     failure: a table whose classification never validates within budget
-    (run_table_classification returns None) is simply skipped -- zero
-    candidates from it, not added to covered_table_anchors -- same
-    graceful degradation as if this whole mechanism didn't exist for that
-    one table."""
+    (run_table_classification returns None) is simply skipped -- absent
+    from the returned dict, exactly as if this whole mechanism didn't
+    exist for that one table."""
     listing = content_reader.list_tables(paper_id, papers_root=_papers_root())
     if not listing.get("found"):
-        return [], set()
+        return {}
 
-    all_candidates: list[EnumerationCandidate] = []
-    covered_anchors: set[str] = set()
+    classifications: dict[str, TableClassification] = {}
     consumed_anchors: set[str] = set()  # anchors already absorbed as a page-split continuation of an earlier table
 
     for table in listing["tables"]:
@@ -1155,7 +1408,7 @@ def run_table_enumeration(
 
         other_tables = [t for t in listing["tables"] if t["table_anchor"] != anchor]
         classification, _error = run_table_classification(
-            run_id=run_id, paper_id=paper_id, entity_type=entity_type,
+            run_id=run_id, paper_id=paper_id,
             seed_table_anchor=anchor, other_tables=other_tables, model=model, invoke=invoke,
         )
         if classification is None:
@@ -1165,6 +1418,117 @@ def run_table_enumeration(
         if not classification.applicable or not classification.row_groups:
             continue
 
+        classifications[anchor] = classification
+
+    return classifications
+
+
+def _table_classifications_to_treatment_candidates(
+    classifications: list[TableClassification], link_pools: dict[str, list[dict]],
+) -> tuple[list[EnumerationCandidate], set[str]]:
+    """Step C, Treatment projection: a Treatment is the DISTINCT
+    combination of factor levels actually applied to one experimental
+    unit -- not any single factor in isolation. Generalizes correctly
+    regardless of how many factors a paper crosses: a single-factor
+    paper's row_groups carry one key in factor_values, so this collapses
+    to exactly the old one-candidate-per-level behavior; a multi-factor
+    paper (2-way factorial, split-plot, ...) naturally produces the FULL
+    cross-product combination, because that combination is simply
+    row_group.factor_values plus (when column-encoded, e.g. a table with
+    'Ames'/'Mead' sub-columns) the relevant value_column.site_hint -- the
+    EXACT SAME combination Step C's Observation projection independently
+    computes as its own match_values for site/method linking. Real
+    evidence this is necessary (Daren-1997-Canopy): free-form enumeration
+    treated 'Population' and 'Maturity' as two flatly separate sets of
+    Treatments, which left no single Treatment able to represent a value
+    that is genuinely about both at once.
+
+    Deduplicates by the exact combination (order-independent) across every
+    (row_group, value_column) pair with a real, non-blank cell -- multiple
+    value_columns sharing the same row/site (e.g. four different measures
+    all reported for 'Trailblazer at Ames') must yield ONE Treatment
+    candidate, not four. Each candidate's linked_candidates is resolved
+    the same deterministic way as Observation's (_match_row_group_to_pool
+    against link_pools, e.g. site_id) -- never a guess."""
+    seen: set[tuple] = set()
+    candidates: list[EnumerationCandidate] = []
+    covered_anchors: set[str] = set()
+
+    for classification in classifications:
+        if not classification.applicable:
+            continue
+        value_columns_by_id = {c.value_column_id: c for c in classification.value_columns}
+        contributed = False
+
+        for row in classification.row_groups:
+            for value_column_id, cell_text in (row.cells or {}).items():
+                if not cell_text or not cell_text.strip():
+                    continue
+                value_column = value_columns_by_id.get(value_column_id)
+                if value_column is None:
+                    continue
+
+                combo = dict(row.factor_values or {})
+                if value_column.site_hint:
+                    combo.setdefault("Site", value_column.site_hint)
+                if not combo:
+                    continue
+
+                contributed = True
+                key = tuple(sorted(combo.items()))
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                candidate_id = _sanitize_candidate_id("_".join(str(v) for _, v in sorted(combo.items())))
+                description = "Experimental condition: " + ", ".join(f"{k}={v}" for k, v in sorted(combo.items()))
+                linked_candidates: dict[str, str] = {}
+                for field, pool in (link_pools or {}).items():
+                    match = _match_row_group_to_pool(combo, pool)
+                    if match:
+                        linked_candidates[field] = match
+
+                candidates.append(EnumerationCandidate(
+                    candidate_id=candidate_id, description=description,
+                    anchors=[row.source_table_anchor], linked_candidates=linked_candidates,
+                ))
+
+        if contributed:
+            covered_anchors.update(classification.table_anchors)
+
+    return candidates, covered_anchors
+
+
+def run_table_enumeration(
+    *, run_id: str, paper_id: str, entity_type: str, model: str,
+    invoke: Callable[..., AgentInvocation] = invoke_agent,
+    link_pools: Optional[dict[str, list[dict]]] = None,
+) -> tuple[list[EnumerationCandidate], set[str]]:
+    """Steps A + B (shared, cached across entity types within one run --
+    see run_table_classification_pass) + Step C (entity-specific
+    projection of the SAME reconstructed tables):
+      - Treatment: the distinct set of factor-level combinations that
+        actually co-occur, deduplicated (see
+        _table_classifications_to_treatment_candidates).
+      - anything else (Observation): one candidate per (row_group,
+        value_column) pair (see _table_classification_to_candidates).
+    Returns (candidates, covered_table_anchors) -- covered_table_anchors
+    is EXACTLY the set of anchors that actually produced >=1 real
+    candidate for THIS entity_type, never every classified-applicable
+    anchor: the caller (Step D, in _run_multi_record_entity) uses this to
+    tell the free-form enumeration pass what NOT to re-report, and a table
+    this function gave up on (or that produced nothing relevant to this
+    particular entity_type) remains fully available to that fallback."""
+    classifications = run_table_classification_pass(run_id=run_id, paper_id=paper_id, model=model, invoke=invoke)
+    if not classifications:
+        return [], set()
+
+    if entity_type == "Treatment":
+        return _table_classifications_to_treatment_candidates(list(classifications.values()), link_pools or {})
+
+    all_candidates: list[EnumerationCandidate] = []
+    covered_anchors: set[str] = set()
+    for classification in classifications.values():
         candidates = _table_classification_to_candidates(classification, link_pools or {})
         if candidates:
             all_candidates.extend(candidates)

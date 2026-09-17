@@ -104,6 +104,13 @@ class TableValueColumn(BaseModel):
     variable_name_hint: str = Field(min_length=1, description="e.g. 'leaf sheath dry weight' -- combines multi-level headers if the source table has them.")
     units_hint: Optional[str] = None
     site_hint: Optional[str] = Field(default=None, description="Set when the column ITSELF encodes a site/location, e.g. a table with separate 'Ames'/'Mead' sub-columns.")
+    method_hint: Optional[str] = Field(
+        default=None,
+        description="The real name/description of the measurement method this column's values were produced by, as "
+                    "actually stated in the paper's Methods section (e.g. 'hand-clipping harvest', 'LI-COR LAI-2000 "
+                    "leaf area analyzer') -- required for Observation.method_id linking (a required field) to ever "
+                    "resolve deterministically; Step C has no other source of method information for a table row.",
+    )
 
 
 class TableRowGroup(BaseModel):
